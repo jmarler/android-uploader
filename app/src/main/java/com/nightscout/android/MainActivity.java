@@ -5,6 +5,7 @@ import android.annotation.TargetApi;
 import android.app.Activity;
 import android.app.AlarmManager;
 import android.app.AlertDialog;
+import android.app.Fragment;
 import android.app.PendingIntent;
 import android.content.BroadcastReceiver;
 import android.content.Context;
@@ -16,11 +17,14 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
+import android.preference.PreferenceManager;
 import android.support.annotation.NonNull;
 import android.util.Log;
+import android.view.LayoutInflater;
 import android.view.Menu;
 import android.view.MenuItem;
 import android.view.View;
+import android.view.ViewGroup;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.widget.ImageView;
@@ -32,9 +36,11 @@ import com.google.android.gms.analytics.Tracker;
 import com.google.common.base.Joiner;
 import com.google.common.base.Splitter;
 import com.nightscout.android.drivers.AndroidUploaderDevice;
-import com.nightscout.android.preferences.AndroidPreferences;
+import com.nightscout.android.exceptions.FeedbackDialog;
+import com.nightscout.android.preferences.PreferenceKeys;
 import com.nightscout.android.preferences.PreferencesValidator;
 import com.nightscout.android.settings.SettingsActivity;
+import com.nightscout.android.ui.AppContainer;
 import com.nightscout.android.wearables.Pebble;
 import com.nightscout.core.dexcom.TrendArrow;
 import com.nightscout.core.dexcom.Utils;
@@ -43,10 +49,6 @@ import com.nightscout.core.preferences.NightscoutPreferences;
 import com.nightscout.core.utils.GlucoseReading;
 import com.nightscout.core.utils.RestUriUtils;
 
-import org.acra.ACRA;
-import org.acra.ACRAConfiguration;
-import org.acra.ACRAConfigurationException;
-import org.acra.ReportingInteractionMode;
 import org.joda.time.DateTime;
 import org.joda.time.Minutes;
 
@@ -54,7 +56,11 @@ import java.net.URI;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
-import java.util.TimeZone;
+
+import javax.inject.Inject;
+
+import butterknife.ButterKnife;
+import butterknife.InjectView;
 
 import static com.nightscout.core.dexcom.SpecialValue.getEGVSpecialValue;
 import static com.nightscout.core.dexcom.SpecialValue.isSpecialValue;
@@ -66,7 +72,6 @@ public class MainActivity extends Activity {
 
     // Receivers
     private CGMStatusReceiver mCGMStatusReceiver;
-
     private ToastReceiver toastReceiver;
 
     // Member components
@@ -76,15 +81,20 @@ public class MainActivity extends Activity {
     private long lastRecordTime = -1;
     private long receiverOffsetFromUploader = 0;
 
-    private NightscoutPreferences preferences;
+    @Inject NightscoutPreferences preferences;
+    @Inject AppContainer appContainer;
+    @Inject
+    FeedbackDialog reporter;
 
     // Analytics mTracker
     private Tracker mTracker;
 
     // UI components
-    private WebView mWebView;
-    private TextView mTextSGV;
-    private TextView mTextTimestamp;
+
+    @InjectView(R.id.webView) WebView mWebView;
+    @InjectView(R.id.sgValue) TextView mTextSGV;
+    @InjectView(R.id.timeAgo) TextView mTextTimestamp;
+
     private StatusBarIcons statusBarIcons;
     private Pebble pebble;
     private AndroidUploaderDevice uploaderDevice;
@@ -98,13 +108,17 @@ public class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         Log.d(TAG, "OnCreate called.");
 
-        preferences = new AndroidPreferences(getApplicationContext());
+        Nightscout app = Nightscout.get(this);
+        app.inject(this);
+
+        ViewGroup group = appContainer.get(this);
+        getLayoutInflater().inflate(R.layout.activity_main, group);
+
+        ButterKnife.inject(this);
+
         migrateToNewStyleRestUris();
         ensureSavedUrisAreValid();
         ensureIUnderstandDialogDisplayed();
-
-        // Add timezone ID to ACRA report
-        ACRA.getErrorReporter().putCustomData("timezone", TimeZone.getDefault().getID());
 
         mTracker = ((Nightscout) getApplicationContext()).getTracker();
 
@@ -128,13 +142,8 @@ public class MainActivity extends Activity {
         toastFilter.addCategory(Intent.CATEGORY_DEFAULT);
         registerReceiver(toastReceiver, toastFilter);
 
-        // Setup UI components
-        setContentView(R.layout.activity_main);
-        mTextSGV = (TextView) findViewById(R.id.sgValue);
         mTextSGV.setTag(R.string.display_sgv, -1);
         mTextSGV.setTag(R.string.display_trend, 0);
-        mTextTimestamp = (TextView) findViewById(R.id.timeAgo);
-        mWebView = (WebView) findViewById(R.id.webView);
         mWebView.setLayerType(View.LAYER_TYPE_SOFTWARE, null);
         WebSettings webSettings = mWebView.getSettings();
         webSettings.setJavaScriptEnabled(true);
@@ -147,7 +156,8 @@ public class MainActivity extends Activity {
         mWebView.setHorizontalScrollBarEnabled(false);
         mWebView.setBackgroundColor(0);
         mWebView.loadUrl("file:///android_asset/index.html");
-        statusBarIcons = new StatusBarIcons();
+
+        statusBarIcons = (StatusBarIcons) getFragmentManager().findFragmentById(R.id.iconLayout);
 
         // If app started due to android.hardware.usb.action.USB_DEVICE_ATTACHED intent, start syncing
         Intent startIntent = getIntent();
@@ -409,13 +419,14 @@ public class MainActivity extends Activity {
             long nextUploadTime = standardMinutes(5).getMillis();
 
             if (responseNextUploadTime > nextUploadTime) {
-                Log.d(TAG, "Receiver's time is less than current record time, possible time change.");
+                Log.d(TAG,
+                      "Receiver's time is less than current record time, possible time change.");
                 mTracker.send(new HitBuilders.EventBuilder("Main", "Time change").build());
             } else if (responseNextUploadTime > 0) {
-                Log.d(TAG, "Setting next upload time to: " + responseNextUploadTime);
+                Log.d(TAG, "Setting next upload time to " + responseNextUploadTime);
                 nextUploadTime = responseNextUploadTime;
             } else {
-                Log.d(TAG, "OUT OF RANGE: Setting next upload time to: " + nextUploadTime + " ms.");
+                Log.d(TAG, "OUT OF RANGE: Setting next upload time to " + nextUploadTime + " ms.");
             }
 
             if (Minutes.minutesBetween(new DateTime(), new DateTime(responseDisplayTime))
@@ -465,7 +476,8 @@ public class MainActivity extends Activity {
         public void run() {
             long delta = new Date().getTime() - lastRecordTime + receiverOffsetFromUploader;
             if (lastRecordTime == 0) delta = 0;
-            String timeAgoStr = "";
+
+            String timeAgoStr;
             if (lastRecordTime == -1) {
                 timeAgoStr = "---";
             } else if (delta < 0) {
@@ -481,7 +493,6 @@ public class MainActivity extends Activity {
 
     @Override
     public boolean onCreateOptionsMenu(Menu menu) {
-        // Inflate the menu; this adds items to the action bar if it is present.
         getMenuInflater().inflate(R.menu.menu, menu);
         return true;
     }
@@ -493,22 +504,7 @@ public class MainActivity extends Activity {
             Intent intent = new Intent(this, SettingsActivity.class);
             startActivity(intent);
         } else if (id == R.id.feedback_settings) {
-            ACRAConfiguration acraConfiguration = ACRA.getConfig();
-            // Set to dialog to get user comments
-            try {
-                acraConfiguration.setMode(ReportingInteractionMode.DIALOG);
-                acraConfiguration.setResToastText(0);
-            } catch (ACRAConfigurationException e) {
-                e.printStackTrace();
-            }
-            ACRA.getErrorReporter().handleException(null);
-            // Reset back to toast
-            try {
-                acraConfiguration.setResToastText(R.string.crash_toast_text);
-                acraConfiguration.setMode(ReportingInteractionMode.TOAST);
-            } catch (ACRAConfigurationException e) {
-                e.printStackTrace();
-            }
+            reporter.show();
         } else if (id == R.id.gap_sync) {
             SyncingService.startActionSingleSync(getApplicationContext(), SyncingService.GAP_SYNC_PAGES);
         } else if (id == R.id.close_settings) {
@@ -519,31 +515,29 @@ public class MainActivity extends Activity {
         return super.onOptionsItemSelected(item);
     }
 
-    public class StatusBarIcons {
-        private ImageView mImageViewUSB;
-        private ImageView mImageViewUpload;
-        private ImageView mImageViewTimeIndicator;
-        private ImageView mImageRcvrBattery;
-        private TextView mRcvrBatteryLabel;
+    public static class StatusBarIcons extends Fragment {
+        @InjectView(R.id.imageViewUSB) ImageView mImageViewUSB;
+        @InjectView(R.id.imageViewUploadStatus) ImageView mImageViewUpload;
+        @InjectView(R.id.imageViewTimeIndicator) ImageView mImageViewTimeIndicator;
+        @InjectView(R.id.imageViewRcvrBattery) ImageView mImageRcvrBattery;
+        @InjectView(R.id.rcvrBatteryLabel) TextView mRcvrBatteryLabel;
+
         private boolean usbActive;
         private boolean uploadActive;
         private boolean displayTimeSync;
         private int batteryLevel;
 
-        StatusBarIcons() {
-            mImageViewUSB = (ImageView) findViewById(R.id.imageViewUSB);
-            mImageViewUpload = (ImageView) findViewById(R.id.imageViewUploadStatus);
-            mImageViewTimeIndicator = (ImageView) findViewById(R.id.imageViewTimeIndicator);
-
-            mImageRcvrBattery = (ImageView) findViewById(R.id.imageViewRcvrBattery);
-            mImageRcvrBattery.setImageResource(R.drawable.battery);
-            mRcvrBatteryLabel = (TextView) findViewById(R.id.rcvrBatteryLabel);
-
+        @Override
+        public View onCreateView(LayoutInflater inflater, ViewGroup container, Bundle savedInstanceState) {
+            View view = inflater.inflate(R.layout.fragment_icon_status, container, false);
+            ButterKnife.inject(this, view);
             setDefaults();
+            return view;
         }
 
         public void checkForRootOptionChanged() {
-            if (((AndroidPreferences) preferences).isRootEnabled()) {
+            if (!PreferenceManager.getDefaultSharedPreferences(
+                getActivity()).getBoolean(PreferenceKeys.ROOT_ENABLED, false)) {
                 mImageRcvrBattery.setVisibility(View.GONE);
                 mRcvrBatteryLabel.setVisibility(View.GONE);
             } else {
@@ -551,7 +545,6 @@ public class MainActivity extends Activity {
                 mRcvrBatteryLabel.setVisibility(View.VISIBLE);
             }
         }
-
 
         public void setDefaults() {
             setUSB(false);
@@ -621,7 +614,7 @@ public class MainActivity extends Activity {
 
     @TargetApi(Build.VERSION_CODES.KITKAT)
     public void setNextPoll(long millis) {
-        Log.d(TAG, "Setting next poll with Alarm for " + (millis) + " ms from now");
+        Log.d(TAG, "Setting next poll with Alarm for " + millis + " ms from now.");
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
             alarmManager.setExact(AlarmManager.RTC_WAKEUP, System.currentTimeMillis() + millis, syncManager);
         } else {
@@ -630,7 +623,7 @@ public class MainActivity extends Activity {
     }
 
     public void cancelPoll() {
-        Log.d(TAG, "Canceling next alarm poll");
+        Log.d(TAG, "Canceling next alarm poll.");
         alarmManager.cancel(syncManager);
     }
 }
